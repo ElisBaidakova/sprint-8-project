@@ -127,3 +127,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Секреты и локальные конфигурации
+secrets.py
+local_config.py
+*.env

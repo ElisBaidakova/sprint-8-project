@@ -1,8 +1,11 @@
 import os
-from datetime import datetime, timezone
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, to_json, col, struct, current_timestamp, unix_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, LongType
+
+# Импортируем конфигурацию
+import config
+import secrets
 
 # Путь к сертификату — из переменной окружения или из контейнера
 ca_cert_path = os.environ.get('KAFKA_CA_CERT', '/root/CA.pem')
@@ -20,11 +23,11 @@ def foreach_batch_function(df, epoch_id):
         'datetime_created', 'client_id', 'trigger_datetime_created'
     ).write \
         .format('jdbc') \
-        .option('url', 'jdbc:postgresql://localhost:5432/de') \
-        .option('driver', 'org.postgresql.Driver') \
-        .option('dbtable', 'subscribers_feedback') \
-        .option('user', 'jovyan') \
-        .option('password', 'jovyan') \
+        .option('url', config.POSTGRES_LOCAL_URL) \
+        .option('driver', config.POSTGRES_DRIVER) \
+        .option('dbtable', config.POSTGRES_FEEDBACK_TABLE) \
+        .option('user', secrets.POSTGRES_USER) \
+        .option('password', secrets.POSTGRES_PASSWORD) \
         .mode('append') \
         .save()
     
@@ -49,41 +52,35 @@ def foreach_batch_function(df, epoch_id):
     # отправляем сообщения в результирующий топик Kafka без поля feedback
     kafka_with_value.write \
         .format('kafka') \
-        .option('kafka.bootstrap.servers', 'rc1b-2erh7b35n4j4v869.mdb.yandexcloud.net:9091') \
-        .option('topic', 'student.topic.cohort12.baidakova.out') \
-        .option('kafka.security.protocol', 'SASL_SSL') \
+        .option('kafka.bootstrap.servers', config.KAFKA_BOOTSTRAP_SERVERS) \
+        .option('topic', config.KAFKA_OUTPUT_TOPIC) \
+        .option('kafka.security.protocol', config.KAFKA_SECURITY_PROTOCOL) \
         .option('kafka.sasl.jaas.config', 
-                'org.apache.kafka.common.security.scram.ScramLoginModule required username="de-student" password="ltcneltyn";') \
-        .option('kafka.sasl.mechanism', 'SCRAM-SHA-512') \
+                f'org.apache.kafka.common.security.scram.ScramLoginModule required username="{secrets.KAFKA_USERNAME}" password="{secrets.KAFKA_PASSWORD}";') \
+        .option('kafka.sasl.mechanism', config.KAFKA_SASL_MECHANISM) \
         .option('kafka.ssl.ca.location', ca_cert_path) \
         .save()
     
     # очищаем память от df
     df.unpersist()
 
-# необходимые библиотеки для интеграции Spark с Kafka и PostgreSQL
-spark_jars_packages = ",".join([
-    "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0",
-    "org.postgresql:postgresql:42.4.0",
-])
-
 # создаём spark сессию
 spark = SparkSession.builder \
-    .appName("RestaurantSubscribeStreamingService") \
+    .appName(config.SPARK_APP_NAME) \
     .config("spark.sql.session.timeZone", "UTC") \
-    .config("spark.jars.packages", spark_jars_packages) \
+    .config("spark.jars.packages", config.SPARK_JARS_PACKAGES) \
     .getOrCreate()
 
 # читаем из топика Kafka сообщения с акциями от ресторанов 
 restaurant_read_stream_df = spark.readStream \
     .format('kafka') \
-    .option('kafka.bootstrap.servers', 'rc1b-2erh7b35n4j4v869.mdb.yandexcloud.net:9091') \
-    .option('kafka.security.protocol', 'SASL_SSL') \
+    .option('kafka.bootstrap.servers', config.KAFKA_BOOTSTRAP_SERVERS) \
+    .option('kafka.security.protocol', config.KAFKA_SECURITY_PROTOCOL) \
     .option('kafka.sasl.jaas.config', 
-            'org.apache.kafka.common.security.scram.ScramLoginModule required username="de-student" password="ltcneltyn";') \
-    .option('kafka.sasl.mechanism', 'SCRAM-SHA-512') \
-    .option('kafka.ssl.ca.location', ca_cert_path) \
-    .option('subscribe', 'student.topic.cohort12.baidakova') \
+            f'org.apache.kafka.common.security.scram.ScramLoginModule required username="{secrets.KAFKA_USERNAME}" password="{secrets.KAFKA_PASSWORD}";') \
+    .option('kafka.sasl.mechanism', config.KAFKA_SASL_MECHANISM) \
+    .option('kafka.ssl.ca.location', config.KAFKA_CA_CERT_PATH) \
+    .option('subscribe', config.KAFKA_INPUT_TOPIC) \
     .load()
 
 # определяем схему входного сообщения для json
@@ -98,26 +95,23 @@ incomming_message_schema = StructType([
     StructField("datetime_created", LongType(), True)
 ])
 
-# определяем текущее время в UTC в секундах
-current_timestamp_utc = int(round(datetime.now(timezone.utc).timestamp()))
-
 # десериализуем из value сообщения json и фильтруем по времени старта и окончания акции
 filtered_read_stream_df = restaurant_read_stream_df \
     .select(from_json(col("value").cast("string"), incomming_message_schema).alias("parsed_value")) \
     .select("parsed_value.*") \
     .filter(
-        (col("adv_campaign_datetime_start") <= current_timestamp_utc) & 
-        (col("adv_campaign_datetime_end") >= current_timestamp_utc)
+        (col("adv_campaign_datetime_start") <= unix_timestamp(current_timestamp())) & 
+        (col("adv_campaign_datetime_end") >= unix_timestamp(current_timestamp()))
     )
 
 # вычитываем всех пользователей с подпиской на рестораны
 subscribers_restaurant_df = spark.read \
     .format('jdbc') \
-    .option('url', 'jdbc:postgresql://rc1a-fswjkpli01zafgjm.mdb.yandexcloud.net:6432/de') \
-    .option('driver', 'org.postgresql.Driver') \
-    .option('dbtable', 'subscribers_restaurants') \
-    .option('user', 'jovyan') \
-    .option('password', 'jovyan') \
+    .option('url', config.POSTGRES_CLOUD_URL) \
+    .option('driver', config.POSTGRES_DRIVER) \
+    .option('dbtable', config.POSTGRES_SUBSCRIBERS_TABLE) \
+    .option('user', secrets.POSTGRES_CLOUD_USER) \
+    .option('password', secrets.POSTGRES_CLOUD_PASSWORD) \
     .load()
 
 # джойним данные из сообщения Kafka с пользователями подписки по restaurant_id (uuid). Добавляем время создания события.
@@ -128,7 +122,7 @@ result_df = filtered_read_stream_df \
 # запускаем стриминг
 result_df.writeStream \
     .foreachBatch(foreach_batch_function) \
-    .outputMode("update") \
-    .option("checkpointLocation", "/tmp/checkpoint") \
+    .outputMode("append") \
+    .option("checkpointLocation", config.CHECKPOINT_LOCATION) \
     .start() \
     .awaitTermination()
